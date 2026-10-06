@@ -2,6 +2,8 @@ package api
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -20,6 +22,10 @@ import (
 	"github.com/wyw14/cry-103/internal/telemetry"
 	"github.com/wyw14/cry-103/internal/topology"
 )
+
+// ErrReceiptConflict indicates a retried receipt carries a different isolation
+// outcome than the receipt already committed for the same operation.
+var ErrReceiptConflict = errors.New("feed receipt conflicts with the committed receipt for this operation")
 
 type Services struct {
 	Clock               platform.Clock
@@ -83,6 +89,38 @@ func (s *Services) Repeater(id string) (*repeater.Repeater, error) {
 
 func (s *Services) Persist(kind, entityID string, value any) error {
 	return s.Journal.Append(kind, entityID, value, s.Clock.Now())
+}
+
+// SubmitReceipt commits a feed isolation receipt durably before making it
+// visible to permit evaluation. It is safe to retry:
+//
+//   - On the first attempt the receipt is appended to the journal, then
+//     published to the in-memory registry, and committed=true is returned.
+//   - If the journal write fails the registry is never touched, so the error
+//     response cannot change the evaluable state of any permit; the caller may
+//     retry with the same body.
+//   - On a replay (a committed receipt already exists for the operation) no
+//     duplicate journal line is written and the canonical committed receipt is
+//     returned with committed=false. A replay whose isolation outcome differs
+//     from the committed receipt fails with ErrReceiptConflict; the registry is
+//     reconciled against the committed ledger before the error is returned.
+func (s *Services) SubmitReceipt(receipt landing.IsolationReceipt) (landing.IsolationReceipt, bool, error) {
+	record, appended, err := s.Journal.CommitOnce("feed-receipt", receipt.OperationID, receipt, s.Clock.Now().UTC())
+	if err != nil {
+		return landing.IsolationReceipt{}, false, err
+	}
+	var committed landing.IsolationReceipt
+	if err := json.Unmarshal(record.Payload, &committed); err != nil {
+		return landing.IsolationReceipt{}, false, fmt.Errorf("decode committed feed receipt: %w", err)
+	}
+	if !appended && !committed.SameAs(receipt) {
+		// Keep the in-memory view a faithful mirror of what was durably
+		// committed; the conflicting retry never becomes evaluable.
+		s.Receipts.Publish(committed)
+		return committed, false, ErrReceiptConflict
+	}
+	s.Receipts.Publish(committed)
+	return committed, appended, nil
 }
 
 func (s *Services) StartWetPlantTest(ctx context.Context, spanID string) repair.TestSnapshot {

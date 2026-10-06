@@ -1,6 +1,7 @@
 package api
 
 import (
+	"errors"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
@@ -37,12 +38,22 @@ func (s *Server) recordReceipt(writer http.ResponseWriter, request *http.Request
 		StationID: stationID, CircuitID: input.CircuitID, OperationID: input.OperationID,
 		Isolated: input.Isolated, ReceivedAt: s.services.Clock.Now().UTC(),
 	}
-	s.services.Receipts.Record(receipt)
-	if err := s.services.Persist("feed-receipt", input.OperationID, receipt); err != nil {
+	committed, created, err := s.services.SubmitReceipt(receipt)
+	if err != nil {
+		if errors.Is(err, ErrReceiptConflict) {
+			writeError(writer, http.StatusConflict, err)
+			return
+		}
+		// Persistence failed: the registry was not modified, so permit
+		// evaluation behaves exactly as before this request.
 		writeError(writer, http.StatusInternalServerError, err)
 		return
 	}
-	writeJSON(writer, http.StatusCreated, receipt)
+	status := http.StatusOK
+	if created {
+		status = http.StatusCreated
+	}
+	writeJSON(writer, status, committed)
 }
 
 func (s *Server) listReceipts(writer http.ResponseWriter, request *http.Request) {
