@@ -37,11 +37,28 @@ func (s *Server) recordReceipt(writer http.ResponseWriter, request *http.Request
 		StationID: stationID, CircuitID: input.CircuitID, OperationID: input.OperationID,
 		Isolated: input.Isolated, ReceivedAt: s.services.Clock.Now().UTC(),
 	}
-	s.services.Receipts.Record(receipt)
+	// Reserve first only to claim the submission slot; the reservation stays
+	// invisible to permit evaluation until persistence succeeds.
+	existing, committed, err := s.services.Receipts.Reserve(receipt)
+	if err != nil {
+		writeError(writer, http.StatusConflict, err)
+		return
+	}
+	if committed {
+		// Idempotent replay of an already-committed receipt: do not append
+		// another journal record and return the first-committed payload.
+		writeJSON(writer, http.StatusCreated, existing)
+		return
+	}
 	if err := s.services.Persist("feed-receipt", input.OperationID, receipt); err != nil {
+		// Compensate: drop the reservation so the failed response leaves the
+		// registry unchanged and the client can retry.
+		s.services.Receipts.Rollback(receipt)
 		writeError(writer, http.StatusInternalServerError, err)
 		return
 	}
+	// Persisted first, only now make the receipt visible to Match.
+	s.services.Receipts.Publish(receipt.StationID, receipt.CircuitID, receipt.OperationID)
 	writeJSON(writer, http.StatusCreated, receipt)
 }
 

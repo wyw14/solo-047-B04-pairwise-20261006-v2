@@ -26,6 +26,12 @@ import (
 
 func testServer(t *testing.T) *Server {
 	t.Helper()
+	server, _ := testServerWithServices(t)
+	return server
+}
+
+func testServerWithServices(t *testing.T) (*Server, *Services) {
+	t.Helper()
 	clock := fixedClock{now: time.Date(2026, 8, 24, 3, 0, 0, 0, time.UTC)}
 	ids := platform.UUIDGenerator{}
 	registry := topology.NewRegistry()
@@ -69,7 +75,7 @@ func testServer(t *testing.T) *Server {
 		Telemetry: telemetry.NewIngestor(repository, clock.Now, projector), TelemetryRepository: repository,
 		Admission: incident.NewAdmissionService(telemetry.NewMuteManager(clock.Now)),
 	}
-	return NewServer(services)
+	return NewServer(services), services
 }
 
 type fixedClock struct {
